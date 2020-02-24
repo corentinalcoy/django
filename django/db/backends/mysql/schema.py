@@ -28,10 +28,15 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     sql_delete_pk = "ALTER TABLE %(table)s DROP PRIMARY KEY"
 
     sql_create_index = 'CREATE INDEX %(name)s ON %(table)s (%(columns)s)%(extra)s'
-    # The name of the column check constraint is the same as the field name on
-    # MariaDB. Adding IF EXISTS clause prevents migrations crash. Constraint is
-    # removed during a "MODIFY" column statement.
-    sql_delete_check = 'ALTER TABLE %(table)s DROP CONSTRAINT IF EXISTS %(name)s'
+
+    @property
+    def sql_delete_check(self):
+        if self.connection.mysql_is_mariadb:
+            # The name of the column check constraint is the same as the field
+            # name on MariaDB. Adding IF EXISTS clause prevents migrations
+            # crash. Constraint is removed during a "MODIFY" column statement.
+            return 'ALTER TABLE %(table)s DROP CONSTRAINT IF EXISTS %(name)s'
+        return 'ALTER TABLE %(table)s DROP CHECK %(name)s'
 
     def quote_value(self, value):
         self.connection.ensure_connection()
@@ -54,10 +59,22 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
 
     @property
     def _supports_limited_data_type_defaults(self):
-        # Only MariaDB >= 10.2.1 supports defaults for BLOB and TEXT.
+        # MariaDB >= 10.2.1 and MySQL >= 8.0.13 supports defaults for BLOB
+        # and TEXT.
         if self.connection.mysql_is_mariadb:
             return self.connection.mysql_version >= (10, 2, 1)
-        return False
+        return self.connection.mysql_version >= (8, 0, 13)
+
+    def _column_default_sql(self, field):
+        if (
+            not self.connection.mysql_is_mariadb and
+            self._supports_limited_data_type_defaults and
+            self._is_limited_data_type(field)
+        ):
+            # MySQL supports defaults for BLOB and TEXT columns only if the
+            # default value is written as an expression i.e. in parentheses.
+            return '(%s)'
+        return super()._column_default_sql(field)
 
     def add_field(self, model, field):
         super().add_field(model, field)

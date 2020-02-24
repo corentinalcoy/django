@@ -1,8 +1,7 @@
 from unittest import mock, skipUnless
 
-from django.db import connection
+from django.db import DatabaseError, connection
 from django.db.models import Index
-from django.db.utils import DatabaseError
 from django.test import TransactionTestCase, skipUnlessDBFeature
 
 from .models import (
@@ -268,8 +267,14 @@ class IntrospectionTests(TransactionTestCase):
             elif details['columns'] == ['up_votes'] and details['check']:
                 assertDetails(details, ['up_votes'], check=True)
                 field_constraints.add(name)
+            elif details['columns'] == ['voting_number'] and details['check']:
+                assertDetails(details, ['voting_number'], check=True)
+                field_constraints.add(name)
             elif details['columns'] == ['ref'] and details['unique']:
                 assertDetails(details, ['ref'], unique=True)
+                field_constraints.add(name)
+            elif details['columns'] == ['voting_number'] and details['unique']:
+                assertDetails(details, ['voting_number'], unique=True)
                 field_constraints.add(name)
             elif details['columns'] == ['article_id'] and details['index']:
                 assertDetails(details, ['article_id'], index=True)

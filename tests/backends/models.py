@@ -5,10 +5,6 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import models
 
 
-class NonIntegerAutoField(models.Model):
-    creation_datetime = models.DateTimeField(primary_key=True)
-
-
 class Square(models.Model):
     root = models.IntegerField()
     square = models.PositiveIntegerField()
@@ -93,6 +89,7 @@ class Item(models.Model):
 
 class Object(models.Model):
     related_objects = models.ManyToManyField("self", db_constraint=False, symmetrical=False)
+    obj_ref = models.ForeignKey('ObjectReference', models.CASCADE, null=True)
 
     def __str__(self):
         return str(self.id)

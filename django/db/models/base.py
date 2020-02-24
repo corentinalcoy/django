@@ -15,13 +15,16 @@ from django.db import (
     DEFAULT_DB_ALIAS, DJANGO_VERSION_PICKLE_KEY, DatabaseError, connection,
     connections, router, transaction,
 )
-from django.db.models import NOT_PROVIDED
+from django.db.models import (
+    NOT_PROVIDED, ExpressionWrapper, IntegerField, Max, Value,
+)
 from django.db.models.constants import LOOKUP_SEP
-from django.db.models.constraints import CheckConstraint, UniqueConstraint
+from django.db.models.constraints import CheckConstraint
 from django.db.models.deletion import CASCADE, Collector
 from django.db.models.fields.related import (
     ForeignObjectRel, OneToOneField, lazy_related_operation, resolve_relation,
 )
+from django.db.models.functions import Coalesce
 from django.db.models.manager import Manager
 from django.db.models.options import Options
 from django.db.models.query import Q
@@ -30,6 +33,7 @@ from django.db.models.signals import (
 )
 from django.db.models.utils import make_model_tuple
 from django.utils.encoding import force_str
+from django.utils.hashable import make_hashable
 from django.utils.text import capfirst, get_text_list
 from django.utils.translation import gettext_lazy as _
 from django.utils.version import get_version
@@ -198,7 +202,7 @@ class ModelBase(type):
                 continue
             # Locate OneToOneField instances.
             for field in base._meta.local_fields:
-                if isinstance(field, OneToOneField):
+                if isinstance(field, OneToOneField) and field.remote_field.parent_link:
                     related = resolve_relation(new_class, field.remote_field.model)
                     parent_links[make_model_tuple(related)] = field
 
@@ -519,7 +523,7 @@ class Model(metaclass=ModelBase):
 
     def __eq__(self, other):
         if not isinstance(other, Model):
-            return False
+            return NotImplemented
         if self._meta.concrete_model != other._meta.concrete_model:
             return False
         my_pk = self.pk
@@ -565,6 +569,9 @@ class Model(metaclass=ModelBase):
         return getattr(self, meta.pk.attname)
 
     def _set_pk_val(self, value):
+        for parent_link in self._meta.parents.values():
+            if parent_link and parent_link != self._meta.pk:
+                setattr(self, parent_link.target_field.attname, value)
         return setattr(self, self._meta.pk.attname, value)
 
     pk = property(_get_pk_val, _set_pk_val)
@@ -845,6 +852,7 @@ class Model(metaclass=ModelBase):
         updated = False
         # Skip an UPDATE when adding an instance and primary key has a default.
         if (
+            not raw and
             not force_insert and
             self._state.adding and
             self._meta.pk.default and
@@ -869,17 +877,20 @@ class Model(metaclass=ModelBase):
                 # autopopulate the _order field
                 field = meta.order_with_respect_to
                 filter_args = field.get_filter_kwargs_for_object(self)
-                order_value = cls._base_manager.using(using).filter(**filter_args).count()
-                self._order = order_value
-
+                self._order = cls._base_manager.using(using).filter(**filter_args).aggregate(
+                    _order__max=Coalesce(
+                        ExpressionWrapper(Max('_order') + Value(1), output_field=IntegerField()),
+                        Value(0),
+                    ),
+                )['_order__max']
             fields = meta.local_concrete_fields
             if not pk_set:
                 fields = [f for f in fields if f is not meta.auto_field]
 
-            update_pk = meta.auto_field and not pk_set
-            result = self._do_insert(cls._base_manager, using, fields, update_pk, raw)
-            if update_pk:
-                setattr(self, meta.pk.attname, result)
+            returning_fields = meta.db_returning_fields
+            results = self._do_insert(cls._base_manager, using, fields, returning_fields, raw)
+            for result, field in zip(results, returning_fields):
+                setattr(self, field.attname, result)
         return updated
 
     def _do_update(self, base_qs, using, pk_val, values, update_fields, forced_update):
@@ -909,13 +920,15 @@ class Model(metaclass=ModelBase):
             )
         return filtered._update(values) > 0
 
-    def _do_insert(self, manager, using, fields, update_pk, raw):
+    def _do_insert(self, manager, using, fields, returning_fields, raw):
         """
-        Do an INSERT. If update_pk is defined then this method should return
-        the new pk for the model.
+        Do an INSERT. If returning_fields is defined then this method should
+        return the newly created data for the model.
         """
-        return manager._insert([self], fields=fields, return_id=update_pk,
-                               using=using, raw=raw)
+        return manager._insert(
+            [self], fields=fields, returning_fields=returning_fields,
+            using=using, raw=raw,
+        )
 
     def delete(self, using=None, keep_parents=False):
         using = using or router.db_for_write(self.__class__, instance=self)
@@ -932,8 +945,9 @@ class Model(metaclass=ModelBase):
 
     def _get_FIELD_display(self, field):
         value = getattr(self, field.attname)
+        choices_dict = dict(make_hashable(field.flatchoices))
         # force_str() to coerce lazy strings.
-        return force_str(dict(field.flatchoices).get(value, value), strings_only=True)
+        return force_str(choices_dict.get(make_hashable(value), value), strings_only=True)
 
     def _get_next_or_previous_by_FIELD(self, field, is_next, **kwargs):
         if not self.pk:
@@ -1009,12 +1023,14 @@ class Model(metaclass=ModelBase):
         unique_checks = []
 
         unique_togethers = [(self.__class__, self._meta.unique_together)]
-        constraints = [(self.__class__, self._meta.constraints)]
+        constraints = [(self.__class__, self._meta.total_unique_constraints)]
         for parent_class in self._meta.get_parent_list():
             if parent_class._meta.unique_together:
                 unique_togethers.append((parent_class, parent_class._meta.unique_together))
-            if parent_class._meta.constraints:
-                constraints.append((parent_class, parent_class._meta.constraints))
+            if parent_class._meta.total_unique_constraints:
+                constraints.append(
+                    (parent_class, parent_class._meta.total_unique_constraints)
+                )
 
         for model_class, unique_together in unique_togethers:
             for check in unique_together:
@@ -1024,10 +1040,7 @@ class Model(metaclass=ModelBase):
 
         for model_class, model_constraints in constraints:
             for constraint in model_constraints:
-                if (isinstance(constraint, UniqueConstraint) and
-                        # Partial unique constraints can't be validated.
-                        constraint.condition is None and
-                        not any(name in exclude for name in constraint.fields)):
+                if not any(name in exclude for name in constraint.fields):
                     unique_checks.append((model_class, constraint.fields))
 
         # These are checks for the unique_for_<date/year/month>.
@@ -1241,6 +1254,7 @@ class Model(metaclass=ModelBase):
     def check(cls, **kwargs):
         errors = [*cls._check_swappable(), *cls._check_model(), *cls._check_managers(**kwargs)]
         if not cls._meta.swapped:
+            databases = kwargs.get('databases') or []
             errors += [
                 *cls._check_fields(**kwargs),
                 *cls._check_m2m_through_same_relationship(),
@@ -1263,7 +1277,7 @@ class Model(metaclass=ModelBase):
                 *cls._check_unique_together(),
                 *cls._check_indexes(),
                 *cls._check_ordering(),
-                *cls._check_constraints(),
+                *cls._check_constraints(databases),
             ]
 
         return errors
@@ -1700,9 +1714,15 @@ class Model(metaclass=ModelBase):
             fld = None
             for part in field.split(LOOKUP_SEP):
                 try:
-                    fld = _cls._meta.get_field(part)
+                    # pk is an alias that won't be found by opts.get_field.
+                    if part == 'pk':
+                        fld = _cls._meta.pk
+                    else:
+                        fld = _cls._meta.get_field(part)
                     if fld.is_relation:
                         _cls = fld.get_path_info()[-1].to_opts.model
+                    else:
+                        _cls = None
                 except (FieldDoesNotExist, AttributeError):
                     if fld is None or fld.get_transform(part) is None:
                         errors.append(
@@ -1816,9 +1836,9 @@ class Model(metaclass=ModelBase):
         return errors
 
     @classmethod
-    def _check_constraints(cls):
+    def _check_constraints(cls, databases):
         errors = []
-        for db in settings.DATABASES:
+        for db in databases:
             if not router.allow_migrate_model(db, cls):
                 continue
             connection = connections[db]
